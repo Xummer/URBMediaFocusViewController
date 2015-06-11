@@ -99,6 +99,8 @@
  */
 - (void)showImageFromURL:(NSURL *)url fromRect:(CGRect)fromRect;
 
+- (void)showImageFromURL:(NSURL *)url fromRect:(CGRect)fromRect placeholderImage:(UIImage *)phImage;
+
 /**
  *  Shows a full size image over the current view or main window. The image should be cached locally on the device, in the app 
  *	bundle or an image generated from `NSData`.

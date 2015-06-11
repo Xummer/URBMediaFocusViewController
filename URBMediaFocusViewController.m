@@ -11,6 +11,7 @@
 #import <AssetsLibrary/AssetsLibrary.h>
 
 #import "URBMediaFocusViewController.h"
+#import "UIImageView+WebCache.h"
 
 static const CGFloat __overlayAlpha = 0.6f;						// opacity of the black overlay displayed below the focused image
 static const CGFloat __animationDuration = 0.18f;				// the base duration for present/dismiss animations (except physics-related ones)
@@ -362,33 +363,133 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 - (void)showImageFromURL:(NSURL *)url fromRect:(CGRect)fromRect {
 	self.fromRect = fromRect;
 	
-	// cancel any outstanding requests if we have one
-	[self cancelURLConnectionIfAny];
-	
-	NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-	if (self.requestHTTPHeaders.count > 0) {
-		for (NSString *key in self.requestHTTPHeaders) {
-			NSString *value = [self.requestHTTPHeaders valueForKey:key];
-			[request setValue:value forHTTPHeaderField:key];
-		}
-	}
-	
-	[self.loadingView startAnimating];
-	
-	// stores data as it's loaded from the request
-	self.urlData = [[NSMutableData alloc] init];
-	
-	// show loading indicator on fromView
-	if (!self.loadingView) {
-		self.loadingView = [[UIActivityIndicatorView alloc] initWithFrame:CGRectMake(0, 0, 30.0, 30.0)];
-	}
-	if (self.fromView) {
-		[self.fromView addSubview:self.loadingView];
-		self.loadingView.center = CGPointMake(CGRectGetWidth(self.fromView.frame) / 2.0, CGRectGetHeight(self.fromView.frame) / 2.0);
-	}
-	
-	NSURLConnection *connection = [[NSURLConnection alloc] initWithRequest:request delegate:self];
-	self.urlConnection = connection;
+    [self showImageFromURL:url fromRect:fromRect placeholderImage:nil];
+}
+
+- (void)showImageFromURL:(NSURL *)url fromRect:(CGRect)fromRect placeholderImage:(UIImage *)phImage {
+    self.fromRect = fromRect;
+    
+    [self view]; // make sure view has loaded first
+    _currentOrientation = [UIApplication sharedApplication].statusBarOrientation;
+    
+    // since UIWindow always use portrait orientation in convertRect:inView:, we need to convert the source view's frame to
+    // this controller's view based on the current interface orientation
+    self.fromRect = [self convertRect:fromRect forOrientation:_currentOrientation];
+    
+    self.imageView.transform = CGAffineTransformIdentity;
+    
+    [self.imageView sd_setImageWithURL:url
+                      placeholderImage:phImage ? : [UIImage imageNamed:@"default_background"]
+                             completed:^(UIImage *image, NSError *error, SDImageCacheType cacheType, NSURL *imageURL) {
+        
+    }];
+    
+    UIImage *image = self.imageView.image;
+    
+    self.imageView.alpha = 0.2;
+    
+    // create snapshot of background if parallax is enabled
+    if (self.parallaxEnabled || self.shouldBlurBackground) {
+        [self createViewsForBackground:NULL];
+        
+        // hide status bar, but store whether or not we need to unhide it later when dismissing this view
+        // NOTE: in iOS 7+, this only works if you set `UIViewControllerBasedStatusBarAppearance` to NO in your Info.plist
+        _unhideStatusBarOnDismiss = ![UIApplication sharedApplication].statusBarHidden;
+        [[UIApplication sharedApplication] setStatusBarHidden:YES withAnimation:UIStatusBarAnimationNone];
+        
+        if ([self respondsToSelector:@selector(setNeedsStatusBarAppearanceUpdate)]) {
+            [self setNeedsStatusBarAppearanceUpdate];
+        }
+    }
+    
+    // update scrollView.contentSize to the size of the image
+    self.scrollView.contentSize = image.size;
+    CGFloat scaleWidth = CGRectGetWidth(self.scrollView.frame) / self.scrollView.contentSize.width;
+    CGFloat scaleHeight = CGRectGetHeight(self.scrollView.frame) / self.scrollView.contentSize.height;
+    CGFloat scale = MIN(scaleWidth, scaleHeight);
+    
+    // image view's destination frame is the size of the image capped to the width/height of the target view
+    CGPoint midpoint = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+    CGSize scaledImageSize = CGSizeMake(image.size.width * scale, image.size.height * scale);
+    CGRect targetRect = CGRectMake(midpoint.x - scaledImageSize.width / 2.0, midpoint.y - scaledImageSize.height / 2.0, scaledImageSize.width, scaledImageSize.height);
+    
+    // set initial frame of image view to match that of the presenting image
+    self.imageView.frame = self.fromRect;
+    _originalFrame = targetRect;
+    
+    // rotate imageView based on current device orientation
+    [self reposition];
+    
+    if (scale < 1.0f) {
+        self.scrollView.minimumZoomScale = 1.0f;
+        self.scrollView.maximumZoomScale = 1.0f / scale;
+    }
+    else {
+        self.scrollView.minimumZoomScale = 1.0f / scale;
+        self.scrollView.maximumZoomScale = 1.0f;
+    }
+    
+    _minScale = self.scrollView.minimumZoomScale;
+    _maxScale = self.scrollView.maximumZoomScale;
+    _lastPinchScale = 1.0f;
+    _hasLaidOut = YES;
+    
+    // register for device orientation changes
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceOrientationChanged:) name:UIDeviceOrientationDidChangeNotification object:nil];
+    // register with the device that we want to know when the device orientation changes
+    [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+    
+    if (self.targetViewController) {
+        [self willMoveToParentViewController:self.targetViewController];
+        if ([UIView instancesRespondToSelector:@selector(setTintAdjustmentMode:)]) {
+            self.targetViewController.view.tintAdjustmentMode = UIViewTintAdjustmentModeDimmed;
+            [self.targetViewController.view tintColorDidChange];
+        }
+        [self.targetViewController addChildViewController:self];
+        [self.targetViewController.view addSubview:self.view];
+        
+        if (self.snapshotView) {
+            [self.targetViewController.view insertSubview:self.snapshotView belowSubview:self.view];
+            [self.targetViewController.view insertSubview:self.blurredSnapshotView aboveSubview:self.snapshotView];
+        }
+    }
+    else {
+        // add this view to the main window if no targetViewController was set
+        if ([UIView instancesRespondToSelector:@selector(setTintAdjustmentMode:)]) {
+            self.keyWindow.tintAdjustmentMode = UIViewTintAdjustmentModeDimmed;
+            [self.keyWindow tintColorDidChange];
+        }
+        [self.keyWindow addSubview:self.view];
+        
+        if (self.snapshotView) {
+            [self.keyWindow insertSubview:self.snapshotView belowSubview:self.view];
+            [self.keyWindow insertSubview:self.blurredSnapshotView aboveSubview:self.snapshotView];
+        }
+    }
+    
+    [UIView animateWithDuration:__animationDuration delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.backgroundView.alpha = 1.0f;
+        self.imageView.alpha = 1.0f;
+        self.imageView.frame = targetRect;
+        
+        if (self.snapshotView) {
+            self.blurredSnapshotView.alpha = 1.0f;
+            if (self.parallaxEnabled) {
+                self.blurredSnapshotView.transform = CGAffineTransformScale(CGAffineTransformIdentity, __backgroundScale, __backgroundScale);
+                self.snapshotView.transform = CGAffineTransformScale(CGAffineTransformIdentity, __backgroundScale, __backgroundScale);
+            }
+        }
+        
+    } completion:^(BOOL finished) {
+        //[self.imageView addGestureRecognizer:self.pinchRecognizer];
+        if (self.targetViewController) {
+            [self didMoveToParentViewController:self.targetViewController];
+        }
+        
+        if ([self.delegate respondsToSelector:@selector(mediaFocusViewControllerDidAppear:)]) {
+            [self.delegate mediaFocusViewControllerDidAppear:self];
+        }
+    }];
 }
 
 - (void)dismiss:(BOOL)animated {
